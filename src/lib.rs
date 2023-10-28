@@ -22,7 +22,6 @@ pub mod dechunker {
         CRC,
     }
 
-    #[repr(C)]
     #[derive(Eq, PartialEq, Debug)]
     pub struct ChunkHeader {
         pub len: u32,
