@@ -481,7 +481,7 @@ pub mod stream_decoder {
                     dechunker::Event::Data(_) => panic!("Data in IEND chunk"),
                     dechunker::Event::EndChunk => {
                         self.state = State::initial();
-                        Ok((None, None))
+                        Ok((None, Some(Event::End)))
                     }
                     _ => panic!("Illegal event inside IEND chunk"),
                 },
@@ -689,6 +689,41 @@ pub mod stream_decoder {
 
             // Hmmm, should we assert that? Which layer checks if we had IEND?
             d.eof().unwrap();
+        }
+
+        #[test]
+        fn decode_iend() {
+            let mut d = StreamDecoder::new();
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 0,
+                    type_: *b"IEND"
+                }))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::EndChunk).unwrap(),
+                (None, Some(Event::End))
+            );
+
+            // Hmmm, should we assert that? Which layer checks if we had IEND?
+            d.eof().unwrap();
+        }
+
+        #[test]
+        fn invalid_iend() {
+            let mut d = StreamDecoder::new();
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 42,
+                    type_: *b"IEND"
+                })),
+                Err(Error::InvalidEndChunkSize)
+            );
         }
     }
 }
