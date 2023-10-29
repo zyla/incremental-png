@@ -1,5 +1,7 @@
 #![no_std]
 
+use heapless::Vec;
+
 #[derive(Debug)]
 pub enum Error {
     UnfinishedChunk,
@@ -15,11 +17,17 @@ pub mod dechunker {
     const CHUNK_HEADER_SIZE: usize = 8;
     const CRC_SIZE: usize = 4;
 
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, PartialEq, Eq, Debug)]
     enum State {
-        ChunkHeader,
+        ChunkHeader(Vec<u8, CHUNK_HEADER_SIZE>),
         InChunk { remaining: usize },
-        CRC,
+        CRC(Vec<u8, CRC_SIZE>),
+    }
+
+    impl State {
+        fn initial() -> Self {
+            Self::ChunkHeader(Vec::new())
+        }
     }
 
     #[derive(Eq, PartialEq, Debug)]
@@ -37,70 +45,61 @@ pub mod dechunker {
         EndChunk,
     }
 
-    pub struct AdvanceToken(State);
-
     impl Dechunker {
         pub fn new() -> Self {
             Self {
-                state: State::ChunkHeader,
+                state: State::initial(),
             }
         }
 
         pub fn eof(&self) -> Result<(), Error> {
-            if self.state != State::ChunkHeader {
-                return Err(Error::UnfinishedChunk);
+            match &self.state {
+                State::ChunkHeader(header) if header.is_empty() => Ok(()),
+                _ => Err(Error::UnfinishedChunk),
             }
-            Ok(())
         }
 
-        pub fn update<'a>(
-            &self,
-            input: &'a [u8],
-        ) -> Result<(usize, AdvanceToken, Option<Event<'a>>), Error> {
-            match self.state {
-                State::ChunkHeader => {
-                    if input.len() < CHUNK_HEADER_SIZE {
-                        return Ok((0, AdvanceToken(self.state), None));
-                    }
-                    let header = ChunkHeader {
-                        len: u32::from_be_bytes(input[0..4].try_into().unwrap()),
-                        type_: input[4..8].try_into().unwrap(),
-                    };
-                    Ok((
-                        CHUNK_HEADER_SIZE,
-                        AdvanceToken(State::InChunk {
+        pub fn update<'a>(&mut self, input: &'a [u8]) -> Result<(usize, Option<Event<'a>>), Error> {
+            match &mut self.state {
+                State::ChunkHeader(buf) => {
+                    let n = core::cmp::min(input.len(), buf.capacity() - buf.len());
+                    buf.extend_from_slice(&input[..n]).unwrap();
+                    if buf.is_full() {
+                        let header = ChunkHeader {
+                            len: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                            type_: buf[4..8].try_into().unwrap(),
+                        };
+                        self.state = State::InChunk {
                             remaining: header.len as usize,
-                        }),
-                        Some(Event::BeginChunk(header)),
-                    ))
+                        };
+                        Ok((CHUNK_HEADER_SIZE, Some(Event::BeginChunk(header))))
+                    } else {
+                        Ok((n, None))
+                    }
                 }
                 State::InChunk { remaining } => {
-                    let n = core::cmp::min(input.len(), remaining);
-                    let next = if remaining == n {
-                        State::CRC
+                    let n = core::cmp::min(input.len(), *remaining);
+                    self.state = if *remaining == n {
+                        State::CRC(Vec::new())
                     } else {
                         State::InChunk {
-                            remaining: remaining - n,
+                            remaining: *remaining - n,
                         }
                     };
-                    Ok((n, AdvanceToken(next), Some(Event::Data(&input[..n]))))
+                    Ok((n, Some(Event::Data(&input[..n]))))
                 }
-                State::CRC => {
-                    if input.len() < CRC_SIZE {
-                        return Ok((0, AdvanceToken(self.state), None));
+                State::CRC(buf) => {
+                    let n = core::cmp::min(input.len(), buf.capacity() - buf.len());
+                    buf.extend_from_slice(&input[..n]).unwrap();
+                    if buf.is_full() {
+                        // Ignoring CRC for now
+                        self.state = State::initial();
+                        Ok((n, Some(Event::EndChunk)))
+                    } else {
+                        Ok((n, None))
                     }
-                    // Ignoring CRC for now
-                    Ok((
-                        CRC_SIZE,
-                        AdvanceToken(State::ChunkHeader),
-                        Some(Event::EndChunk),
-                    ))
                 }
             }
-        }
-
-        pub fn advance(&mut self, token: AdvanceToken) {
-            self.state = token.0;
         }
     }
 
@@ -118,7 +117,7 @@ pub mod dechunker {
                 0, 0, 0, 0, // crc (ignored)
             ];
 
-            let (n, token, event) = d.update(data).unwrap();
+            let (n, event) = d.update(data).unwrap();
             assert_eq!(
                 event,
                 Some(Event::BeginChunk(ChunkHeader {
@@ -127,17 +126,14 @@ pub mod dechunker {
                 }))
             );
             data = &data[n..];
-            d.advance(token);
 
-            let (n, token, event) = d.update(data).unwrap();
+            let (n, event) = d.update(data).unwrap();
             assert_eq!(event, Some(Event::Data(b"hello")));
             data = &data[n..];
-            d.advance(token);
 
-            let (n, token, event) = d.update(data).unwrap();
+            let (n, event) = d.update(data).unwrap();
             assert_eq!(event, Some(Event::EndChunk));
             data = &data[n..];
-            d.advance(token);
 
             assert_eq!(data, b"");
             d.eof().unwrap();
