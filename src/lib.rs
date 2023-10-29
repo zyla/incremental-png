@@ -10,6 +10,7 @@ pub enum Error {
     NoImageHeader,
     InvalidDeflateStream,
     ChecksumMismatch,
+    InvalidEndChunkSize,
 }
 
 pub mod dechunker {
@@ -107,7 +108,14 @@ pub mod dechunker {
                             remaining: *remaining - n,
                         }
                     };
-                    Ok((n, Some(Event::Data(&input[..n]))))
+                    Ok((
+                        n,
+                        if n == 0 {
+                            None
+                        } else {
+                            Some(Event::Data(&input[..n]))
+                        },
+                    ))
                 }
                 State::CRC(buf) => {
                     let n = core::cmp::min(input.len(), buf.capacity() - buf.len());
@@ -225,6 +233,38 @@ pub mod dechunker {
         }
 
         #[test]
+        fn decode_empty_chunk() {
+            let mut d = Dechunker::new_without_png_signature();
+            let mut data: &[u8] = &[
+                0, 0, 0, 0, // len
+                b'I', b'E', b'N', b'D', // type
+                0, 0, 0, 0, // crc (ignored)
+            ];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(
+                event,
+                Some(Event::BeginChunk(ChunkHeader {
+                    len: 0,
+                    type_: *b"IEND"
+                }))
+            );
+            data = &data[n..];
+
+            // Note: no data event
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(event, None);
+            data = &data[n..];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(event, Some(Event::EndChunk));
+            data = &data[n..];
+
+            assert_eq!(data, b"");
+            d.eof().unwrap();
+        }
+
+        #[test]
         fn partial_chunk_header() {
             let mut d = Dechunker::new_without_png_signature();
             let mut data: &[u8] = &[
@@ -309,6 +349,7 @@ pub mod stream_decoder {
         IHDR(Vec<u8, { ImageHeader::SIZE }>),
         IDAT,
         IgnoredChunk,
+        IEND,
     }
 
     impl State {
@@ -341,6 +382,7 @@ pub mod stream_decoder {
     pub enum Event<'a> {
         ImageHeader(ImageHeader),
         ImageData(&'a [u8]),
+        End,
     }
 
     impl StreamDecoder {
@@ -373,8 +415,12 @@ pub mod stream_decoder {
                         self.state = State::IDAT;
                         Ok((None, None))
                     }
-                    dechunker::Event::BeginChunk(ChunkHeader { type_: IEND, .. }) => {
-                        todo!()
+                    dechunker::Event::BeginChunk(ChunkHeader { type_: IEND, len }) => {
+                        if len != 0 {
+                            return Err(Error::InvalidEndChunkSize);
+                        }
+                        self.state = State::IEND;
+                        Ok((None, None))
                     }
                     dechunker::Event::BeginChunk(ChunkHeader { .. }) => {
                         self.state = State::IgnoredChunk;
@@ -428,6 +474,15 @@ pub mod stream_decoder {
                         Ok((None, None))
                     }
                     _ => panic!("Illegal event inside ignored chunk"),
+                },
+
+                State::IEND => match input {
+                    dechunker::Event::Data(_) => panic!("Data in IEND chunk"),
+                    dechunker::Event::EndChunk => {
+                        self.state = State::initial();
+                        Ok((None, None))
+                    }
+                    _ => panic!("Illegal event inside IEND chunk"),
                 },
             }
         }
@@ -594,9 +649,11 @@ pub mod inflater {
 
     #[derive(Eq, PartialEq, Debug)]
     pub enum Event<'a> {
-        /// Passthrough ImageHeader
+        /// Passthrough
         ImageHeader(ImageHeader),
         ImageData(&'a [u8]),
+        /// Passthrough
+        End,
     }
 
     impl<const BUFFER_SIZE: usize> Inflater<BUFFER_SIZE> {
@@ -649,6 +706,7 @@ pub mod inflater {
                         Some(Event::ImageData(&self.output_buf[..result.bytes_written])),
                     ))
                 }
+                sd::Event::End => Ok((None, Some(Event::End))),
             }
         }
     }
