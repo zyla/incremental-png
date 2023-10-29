@@ -223,6 +223,7 @@ pub mod stream_decoder {
     enum State {
         BeforeChunk,
         IHDR(Vec<u8, { ImageHeader::SIZE }>),
+        IDAT,
     }
 
     impl State {
@@ -244,9 +245,11 @@ pub mod stream_decoder {
     }
 
     impl ImageHeader {
-        const TYPE: ChunkType = *b"IHDR";
         const SIZE: usize = 13;
     }
+
+    const IHDR: ChunkType = *b"IHDR";
+    const IDAT: ChunkType = *b"IDAT";
 
     #[derive(Eq, PartialEq, Debug)]
     pub enum Event<'a> {
@@ -272,14 +275,16 @@ pub mod stream_decoder {
         ) -> Result<(Option<dechunker::Event<'a>>, Option<Event<'a>>), Error> {
             match &mut self.state {
                 State::BeforeChunk => match input {
-                    dechunker::Event::BeginChunk(ChunkHeader {
-                        len,
-                        type_: ImageHeader::TYPE,
-                    }) => {
+                    dechunker::Event::BeginChunk(ChunkHeader { len, type_: IHDR }) => {
                         if len as usize != ImageHeader::SIZE {
                             return Err(Error::InvalidImageHeaderLength);
                         }
                         self.state = State::IHDR(Vec::new());
+                        Ok((None, None))
+                    }
+                    dechunker::Event::BeginChunk(ChunkHeader { type_: IDAT, .. }) => {
+                        // TODO: check if we got header already?
+                        self.state = State::IDAT;
                         Ok((None, None))
                     }
                     _ => panic!("Illegal event in BeforeChunk state"),
@@ -312,6 +317,15 @@ pub mod stream_decoder {
                     dechunker::Event::BeginChunk(_) => {
                         panic!("Illegal BeginChunk inside of existing chunk")
                     }
+                },
+
+                State::IDAT => match input {
+                    dechunker::Event::Data(input) => Ok((None, Some(Event::ImageData(input)))),
+                    dechunker::Event::EndChunk => {
+                        self.state = State::initial();
+                        Ok((None, None))
+                    }
+                    _ => panic!("Illegal event inside IDAT chunk"),
                 },
             }
         }
@@ -410,6 +424,30 @@ pub mod stream_decoder {
                     }))
                 )
             );
+
+            // Hmmm, should we assert that? Which layer checks if we had IEND?
+            d.eof().unwrap();
+        }
+
+        #[test]
+        fn decode_simple_idat() {
+            let mut d = StreamDecoder::new();
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 5,
+                    type_: *b"IDAT"
+                }))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::Data(b"hello")).unwrap(),
+                (None, Some(Event::ImageData(b"hello")))
+            );
+
+            assert_eq!(d.update(dechunker::Event::EndChunk).unwrap(), (None, None,));
 
             // Hmmm, should we assert that? Which layer checks if we had IEND?
             d.eof().unwrap();
