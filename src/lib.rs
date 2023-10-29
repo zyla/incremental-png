@@ -199,5 +199,11 @@ pub mod dechunker {
             assert_eq!(data, b"");
             d.eof().unwrap();
         }
+
+        #[test]
+        #[ignore = "test not implemented"]
+        fn test_unfinished_chunk() {
+            todo!()
+        }
     }
 }
