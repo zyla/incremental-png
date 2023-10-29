@@ -72,7 +72,7 @@ pub mod dechunker {
                         self.state = State::InChunk {
                             remaining: header.len as usize,
                         };
-                        Ok((CHUNK_HEADER_SIZE, Some(Event::BeginChunk(header))))
+                        Ok((n, Some(Event::BeginChunk(header))))
                     } else {
                         Ok((n, None))
                     }
@@ -129,6 +129,67 @@ pub mod dechunker {
 
             let (n, event) = d.update(data).unwrap();
             assert_eq!(event, Some(Event::Data(b"hello")));
+            data = &data[n..];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(event, Some(Event::EndChunk));
+            data = &data[n..];
+
+            assert_eq!(data, b"");
+            d.eof().unwrap();
+        }
+
+        #[test]
+        fn partial_chunk_header() {
+            let mut d = Dechunker::new();
+            let mut data: &[u8] = &[
+                0, 0, 0, 5, // len
+                b'I', b'D', b'A', b'T', // type
+            ];
+
+            let (n, event) = d.update(&data[..5]).unwrap();
+            assert_eq!(event, None);
+            data = &data[n..];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(
+                event,
+                Some(Event::BeginChunk(ChunkHeader {
+                    len: 5,
+                    type_: *b"IDAT"
+                }))
+            );
+            data = &data[n..];
+
+            assert_eq!(data, b"");
+        }
+
+        #[test]
+        fn partial_data() {
+            let mut d = Dechunker::new();
+            let mut data: &[u8] = &[
+                0, 0, 0, 5, // len
+                b'I', b'D', b'A', b'T', // type
+                b'h', b'e', b'l', b'l', b'o', // data
+                0, 0, 0, 0, // crc (ignored)
+            ];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(
+                event,
+                Some(Event::BeginChunk(ChunkHeader {
+                    len: 5,
+                    type_: *b"IDAT"
+                }))
+            );
+            data = &data[n..];
+
+            let (n, event) = d.update(&data[..3]).unwrap();
+            assert_eq!(event, Some(Event::Data(b"hel")));
+            data = &data[n..];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(event, Some(Event::Data(b"lo")));
             data = &data[n..];
 
             let (n, event) = d.update(data).unwrap();
