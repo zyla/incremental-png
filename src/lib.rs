@@ -224,6 +224,7 @@ pub mod stream_decoder {
         BeforeChunk,
         IHDR(Vec<u8, { ImageHeader::SIZE }>),
         IDAT,
+        IgnoredChunk,
     }
 
     impl State {
@@ -250,6 +251,7 @@ pub mod stream_decoder {
 
     const IHDR: ChunkType = *b"IHDR";
     const IDAT: ChunkType = *b"IDAT";
+    const IEND: ChunkType = *b"IEND";
 
     #[derive(Eq, PartialEq, Debug)]
     pub enum Event<'a> {
@@ -285,6 +287,13 @@ pub mod stream_decoder {
                     dechunker::Event::BeginChunk(ChunkHeader { type_: IDAT, .. }) => {
                         // TODO: check if we got header already?
                         self.state = State::IDAT;
+                        Ok((None, None))
+                    }
+                    dechunker::Event::BeginChunk(ChunkHeader { type_: IEND, .. }) => {
+                        todo!()
+                    }
+                    dechunker::Event::BeginChunk(ChunkHeader { .. }) => {
+                        self.state = State::IgnoredChunk;
                         Ok((None, None))
                     }
                     _ => panic!("Illegal event in BeforeChunk state"),
@@ -326,6 +335,15 @@ pub mod stream_decoder {
                         Ok((None, None))
                     }
                     _ => panic!("Illegal event inside IDAT chunk"),
+                },
+
+                State::IgnoredChunk => match input {
+                    dechunker::Event::Data(_) => Ok((None, None)),
+                    dechunker::Event::EndChunk => {
+                        self.state = State::initial();
+                        Ok((None, None))
+                    }
+                    _ => panic!("Illegal event inside ignored chunk"),
                 },
             }
         }
@@ -445,6 +463,30 @@ pub mod stream_decoder {
             assert_eq!(
                 d.update(dechunker::Event::Data(b"hello")).unwrap(),
                 (None, Some(Event::ImageData(b"hello")))
+            );
+
+            assert_eq!(d.update(dechunker::Event::EndChunk).unwrap(), (None, None,));
+
+            // Hmmm, should we assert that? Which layer checks if we had IEND?
+            d.eof().unwrap();
+        }
+
+        #[test]
+        fn ignored_chunk() {
+            let mut d = StreamDecoder::new();
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 5,
+                    type_: *b"tEXt"
+                }))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::Data(b"hello")).unwrap(),
+                (None, None)
             );
 
             assert_eq!(d.update(dechunker::Event::EndChunk).unwrap(), (None, None,));
