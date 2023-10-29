@@ -556,6 +556,9 @@ pub mod inflater {
 
                     let leftover_input = if result.bytes_consumed < input.len() {
                         Some(sd::Event::ImageData(&input[result.bytes_consumed..]))
+                    } else if result.bytes_written == self.output_buf.len() {
+                        // If we filled the output buffer, we might possibly need more calls
+                        Some(sd::Event::ImageData(&[]))
                     } else {
                         None
                     };
@@ -591,7 +594,7 @@ pub mod inflater {
 
         #[test]
         fn decode_inflated_output() {
-            const N: usize = 2048;
+            const N: usize = 65536;
 
             let mut d = Inflater::<1024>::new();
 
