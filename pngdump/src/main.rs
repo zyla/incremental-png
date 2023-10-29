@@ -8,6 +8,9 @@ use incremental_png::{dechunker::Dechunker, inflater::Inflater, stream_decoder::
 struct Args {
     #[arg()]
     input_file: PathBuf,
+
+    #[arg(long, default_value_t = 1024)]
+    input_buffer_size: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -18,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     let mut sd = StreamDecoder::new();
     let mut inflater = Inflater::<1024>::new();
 
-    let mut buf = [0u8; 32];
+    let mut buf = vec![0u8; args.input_buffer_size];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
