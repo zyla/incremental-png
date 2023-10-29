@@ -4,6 +4,7 @@ use heapless::Vec;
 
 #[derive(Eq, PartialEq, Debug)]
 pub enum Error {
+    InvalidPngSignature,
     UnfinishedChunk,
     InvalidImageHeaderLength,
     NoImageHeader,
@@ -23,15 +24,10 @@ pub mod dechunker {
 
     #[derive(Clone, PartialEq, Eq, Debug)]
     enum State {
+        PngSignature { pos: usize },
         ChunkHeader(Vec<u8, CHUNK_HEADER_SIZE>),
         InChunk { remaining: usize },
         CRC(Vec<u8, CRC_SIZE>),
-    }
-
-    impl State {
-        fn initial() -> Self {
-            Self::ChunkHeader(Vec::new())
-        }
     }
 
     #[derive(Eq, PartialEq, Debug)]
@@ -49,10 +45,20 @@ pub mod dechunker {
         EndChunk,
     }
 
+    /// <https://www.w3.org/TR/png-3/#5PNG-file-signature>
+    const PNG_SIGNATURE: &[u8; 8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
     impl Dechunker {
         pub fn new() -> Self {
             Self {
-                state: State::initial(),
+                state: State::PngSignature { pos: 0 },
+            }
+        }
+
+        #[cfg(test)]
+        fn new_without_png_signature() -> Self {
+            Self {
+                state: State::ChunkHeader(Vec::new()),
             }
         }
 
@@ -65,6 +71,17 @@ pub mod dechunker {
 
         pub fn update<'a>(&mut self, input: &'a [u8]) -> Result<(usize, Option<Event<'a>>), Error> {
             match &mut self.state {
+                State::PngSignature { pos } => {
+                    let n = core::cmp::min(input.len(), PNG_SIGNATURE.len() - *pos);
+                    if &input[..n] != &PNG_SIGNATURE[*pos..*pos + n] {
+                        return Err(Error::InvalidPngSignature);
+                    }
+                    *pos += n;
+                    if *pos == PNG_SIGNATURE.len() {
+                        self.state = State::ChunkHeader(Vec::new());
+                    }
+                    Ok((n, None))
+                }
                 State::ChunkHeader(buf) => {
                     let n = core::cmp::min(input.len(), buf.capacity() - buf.len());
                     buf.extend_from_slice(&input[..n]).unwrap();
@@ -97,7 +114,7 @@ pub mod dechunker {
                     buf.extend_from_slice(&input[..n]).unwrap();
                     if buf.is_full() {
                         // Ignoring CRC for now
-                        self.state = State::initial();
+                        self.state = State::ChunkHeader(Vec::new());
                         Ok((n, Some(Event::EndChunk)))
                     } else {
                         Ok((n, None))
@@ -112,8 +129,72 @@ pub mod dechunker {
         use super::*;
 
         #[test]
-        fn decode_simple_chunk() {
+        fn png_signature_and_chunk_header() {
             let mut d = Dechunker::new();
+            let mut data: &[u8] = &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
+                0, 0, 0, 13, // len
+                b'I', b'H', b'D', b'R', // type
+            ];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(event, None);
+            data = &data[n..];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(
+                event,
+                Some(Event::BeginChunk(ChunkHeader {
+                    len: 13,
+                    type_: *b"IHDR"
+                }))
+            );
+            data = &data[n..];
+
+            assert_eq!(data, b"");
+        }
+
+        #[test]
+        fn partial_png_signature_and_chunk_header() {
+            let mut d = Dechunker::new();
+            let mut data: &[u8] = &[
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
+                0, 0, 0, 13, // len
+                b'I', b'H', b'D', b'R', // type
+            ];
+
+            let (n, event) = d.update(&data[..3]).unwrap();
+            assert_eq!(event, None);
+            data = &data[n..];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(event, None);
+            data = &data[n..];
+
+            let (n, event) = d.update(data).unwrap();
+            assert_eq!(
+                event,
+                Some(Event::BeginChunk(ChunkHeader {
+                    len: 13,
+                    type_: *b"IHDR"
+                }))
+            );
+            data = &data[n..];
+
+            assert_eq!(data, b"");
+        }
+
+        #[test]
+        fn invalid_png_signature() {
+            let mut d = Dechunker::new();
+            let data: &[u8] = b"thesignatureisinvalid";
+
+            assert_eq!(d.update(&data[..3]), Err(Error::InvalidPngSignature));
+        }
+
+        #[test]
+        fn decode_simple_chunk() {
+            let mut d = Dechunker::new_without_png_signature();
             let mut data: &[u8] = &[
                 0, 0, 0, 5, // len
                 b'I', b'D', b'A', b'T', // type
@@ -145,7 +226,7 @@ pub mod dechunker {
 
         #[test]
         fn partial_chunk_header() {
-            let mut d = Dechunker::new();
+            let mut d = Dechunker::new_without_png_signature();
             let mut data: &[u8] = &[
                 0, 0, 0, 5, // len
                 b'I', b'D', b'A', b'T', // type
@@ -170,7 +251,7 @@ pub mod dechunker {
 
         #[test]
         fn partial_data() {
-            let mut d = Dechunker::new();
+            let mut d = Dechunker::new_without_png_signature();
             let mut data: &[u8] = &[
                 0, 0, 0, 5, // len
                 b'I', b'D', b'A', b'T', // type
