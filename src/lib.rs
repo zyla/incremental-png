@@ -451,6 +451,7 @@ pub mod stream_decoder {
                             filter_method: buf[11],
                             interlace_method: buf[12],
                         };
+                        self.state = State::BeforeChunk;
                         Ok((None, Some(Event::ImageHeader(header))))
                     }
                     dechunker::Event::BeginChunk(_) => {
@@ -533,6 +534,62 @@ pub mod stream_decoder {
 
             // Hmmm, should we assert that? Which layer checks if we had IEND?
             d.eof().unwrap();
+        }
+
+        #[test]
+        fn decode_simple_ihdr_and_next_chunk() {
+            let mut d = StreamDecoder::new();
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 13,
+                    type_: *b"IHDR"
+                }))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::Data(&[
+                    0, 0, 0, 1, // width
+                    0, 0, 0, 2, // height
+                    3, 4, 5, 6, 7
+                ]))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::EndChunk).unwrap(),
+                (
+                    None,
+                    Some(Event::ImageHeader(ImageHeader {
+                        width: 1,
+                        height: 2,
+                        bit_depth: 3,
+                        colour_type: 4,
+                        compression_method: 5,
+                        filter_method: 6,
+                        interlace_method: 7,
+                    }))
+                )
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 0,
+                    type_: *b"IDAT"
+                }))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::Data(&[])).unwrap(),
+                (None, Some(Event::ImageData(&[])))
+            );
+
+            assert_eq!(d.update(dechunker::Event::EndChunk).unwrap(), (None, None));
         }
 
         #[test]
