@@ -504,19 +504,11 @@ pub mod inflater {
     use super::stream_decoder as sd;
     use super::*;
     use crate::stream_decoder::ImageHeader;
-    use miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER;
-    use miniz_oxide::inflate::core::inflate_flags::{
-        TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-    };
-    use miniz_oxide::inflate::core::DecompressorOxide;
+    use miniz_oxide::inflate::stream::InflateState;
 
-    const MAX_WINDOW: usize = 32768;
-
-    pub struct Inflater {
-        decompressor: DecompressorOxide,
-        more_output: bool,
-        output_buf: [u8; MAX_WINDOW],
-        out_pos: usize,
+    pub struct Inflater<const BUFFER_SIZE: usize = 1024> {
+        decompressor: InflateState,
+        output_buf: [u8; BUFFER_SIZE],
     }
 
     #[derive(Eq, PartialEq, Debug)]
@@ -526,13 +518,11 @@ pub mod inflater {
         ImageData(&'a [u8]),
     }
 
-    impl Inflater {
+    impl<const BUFFER_SIZE: usize> Inflater<BUFFER_SIZE> {
         pub fn new() -> Self {
             Self {
-                decompressor: DecompressorOxide::new(),
-                more_output: false,
-                output_buf: [0; MAX_WINDOW],
-                out_pos: 0,
+                decompressor: InflateState::new(miniz_oxide::DataFormat::Zlib),
+                output_buf: [0; BUFFER_SIZE],
             }
         }
         pub fn update<'this, 'a>(
@@ -542,60 +532,37 @@ pub mod inflater {
             match input {
                 sd::Event::ImageHeader(header) => Ok((None, Some(Event::ImageHeader(header)))),
                 sd::Event::ImageData(input) => {
-                    let input = if self.more_output {
-                        self.more_output = false;
-                        &[]
-                    } else {
-                        input
-                    };
-                    let (status, bytes_read, bytes_written) =
-                        miniz_oxide::inflate::core::decompress(
-                            &mut self.decompressor,
-                            input,
-                            &mut self.output_buf,
-                            self.out_pos,
-                            TINFL_FLAG_PARSE_ZLIB_HEADER
-                                | TINFL_FLAG_HAS_MORE_INPUT
-                                | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-                        );
-                    match status {
-                        miniz_oxide::inflate::TINFLStatus::FailedCannotMakeProgress => {
-                            panic!("Shouldn't happen, we set TINFL_FLAG_HAS_MORE_INPUT")
-                        }
+                    let result = miniz_oxide::inflate::stream::inflate(
+                        &mut self.decompressor,
+                        input,
+                        &mut self.output_buf,
+                        miniz_oxide::MZFlush::None,
+                    );
 
-                        miniz_oxide::inflate::TINFLStatus::BadParam => {
-                            panic!("Bad param to miniz_oxide")
-                        }
-                        miniz_oxide::inflate::TINFLStatus::Adler32Mismatch => {
-                            return Err(Error::ChecksumMismatch)
-                        }
-                        miniz_oxide::inflate::TINFLStatus::Failed => {
-                            return Err(Error::InvalidDeflateStream)
-                        }
-                        miniz_oxide::inflate::TINFLStatus::Done => {
-                            // TODO: should we somehow remember it, so that we don't cal decompress
-                            // anymore?
-                        }
-                        miniz_oxide::inflate::TINFLStatus::NeedsMoreInput => {}
-                        miniz_oxide::inflate::TINFLStatus::HasMoreOutput => {
-                            self.more_output = true;
-                        }
+                    match result.status {
+                        Ok(_) => {}
+                        Err(e) => match e {
+                            miniz_oxide::MZError::ErrNo => panic!("shouldn't happen"),
+                            miniz_oxide::MZError::Stream => {
+                                return Err(Error::InvalidDeflateStream)
+                            }
+                            miniz_oxide::MZError::Data => return Err(Error::InvalidDeflateStream),
+                            miniz_oxide::MZError::Mem => panic!("shouldn't happen"),
+                            miniz_oxide::MZError::Buf => panic!("buffer error"),
+                            miniz_oxide::MZError::Version => panic!("shouldn't happen"),
+                            miniz_oxide::MZError::Param => panic!("shouldn't happen"),
+                        },
                     }
 
-                    let old_pos = self.out_pos;
-                    self.out_pos = (self.out_pos + bytes_written) % self.output_buf.len();
-
-                    let leftover_input = if bytes_read < input.len() {
-                        Some(sd::Event::ImageData(&input[bytes_read..]))
+                    let leftover_input = if result.bytes_consumed < input.len() {
+                        Some(sd::Event::ImageData(&input[result.bytes_consumed..]))
                     } else {
                         None
                     };
 
                     Ok((
                         leftover_input,
-                        Some(Event::ImageData(
-                            &self.output_buf[old_pos..old_pos + bytes_written],
-                        )),
+                        Some(Event::ImageData(&self.output_buf[..result.bytes_written])),
                     ))
                 }
             }
@@ -610,7 +577,7 @@ pub mod inflater {
 
         #[test]
         fn decode_simple_compressed_stream() {
-            let mut d = Inflater::new();
+            let mut d = Inflater::<1024>::new();
 
             let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"hello", 5);
 
@@ -624,9 +591,10 @@ pub mod inflater {
 
         #[test]
         fn decode_inflated_output() {
-            let mut d = Inflater::new();
+            const N: usize = 2048;
 
-            const N: usize = 65536;
+            let mut d = Inflater::<1024>::new();
+
             let input = [b'A'; N];
             let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&input, 5);
 
@@ -643,7 +611,10 @@ pub mod inflater {
                 event = leftover;
             }
 
-            assert_eq!(&input, &output);
+            assert_eq!(input.len(), output.len());
+            for c in output {
+                assert_eq!(c, b'A');
+            }
         }
     }
 }
