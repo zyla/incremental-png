@@ -30,15 +30,15 @@ fn main() -> anyhow::Result<()> {
             let (consumed, mut dc_event) = dechunker.update(&input).unwrap();
 
             while let Some(e) = dc_event {
-                println!("dc: {:?}", e);
+                println!("c: {:?}", e);
 
                 let (leftover, mut sd_event) = sd.update(e).unwrap();
 
                 while let Some(e) = sd_event {
-                    println!("sd: {:?}", e);
+                    println!(" s: {:?}", e);
                     let (leftover, i_event) = inflater.update(e).unwrap();
 
-                    println!("i: {:?}", i_event);
+                    println!("  i: {:?}", i_event);
 
                     sd_event = leftover;
                 }
