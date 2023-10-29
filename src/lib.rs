@@ -2,9 +2,10 @@
 
 use heapless::Vec;
 
-#[derive(Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum Error {
     UnfinishedChunk,
+    InvalidImageHeaderLength,
 }
 
 pub mod dechunker {
@@ -204,6 +205,214 @@ pub mod dechunker {
         #[ignore = "test not implemented"]
         fn test_unfinished_chunk() {
             todo!()
+        }
+    }
+}
+
+pub mod stream_decoder {
+    use crate::dechunker::ChunkHeader;
+    use crate::dechunker::ChunkType;
+
+    use super::*;
+
+    pub struct StreamDecoder {
+        state: State,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    enum State {
+        BeforeChunk,
+        IHDR(Vec<u8, { ImageHeader::SIZE }>),
+    }
+
+    impl State {
+        fn initial() -> Self {
+            Self::BeforeChunk
+        }
+    }
+
+    /// <https://www.w3.org/TR/png-3/#11IHDR>
+    #[derive(Eq, PartialEq, Debug)]
+    pub struct ImageHeader {
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        colour_type: u8,
+        compression_method: u8,
+        filter_method: u8,
+        interlace_method: u8,
+    }
+
+    impl ImageHeader {
+        const TYPE: ChunkType = *b"IHDR";
+        const SIZE: usize = 13;
+    }
+
+    #[derive(Eq, PartialEq, Debug)]
+    pub enum Event<'a> {
+        ImageHeader(ImageHeader),
+        ImageData(&'a [u8]),
+    }
+
+    impl StreamDecoder {
+        pub fn new() -> Self {
+            Self {
+                state: State::initial(),
+            }
+        }
+
+        pub fn eof(&self) -> Result<(), Error> {
+            // TODO: we should check if we got IEND
+            Ok(())
+        }
+
+        pub fn update<'a>(
+            &mut self,
+            input: dechunker::Event<'a>,
+        ) -> Result<(Option<dechunker::Event<'a>>, Option<Event<'a>>), Error> {
+            match &mut self.state {
+                State::BeforeChunk => match input {
+                    dechunker::Event::BeginChunk(ChunkHeader {
+                        len,
+                        type_: ImageHeader::TYPE,
+                    }) => {
+                        if len as usize != ImageHeader::SIZE {
+                            return Err(Error::InvalidImageHeaderLength);
+                        }
+                        self.state = State::IHDR(Vec::new());
+                        Ok((None, None))
+                    }
+                    _ => panic!("Illegal event in BeforeChunk state"),
+                },
+
+                State::IHDR(buf) => match input {
+                    dechunker::Event::Data(input) => {
+                        if buf.extend_from_slice(input).is_err() {
+                            panic!("Too much data in IHDR chunk");
+                        }
+                        Ok((None, None))
+                    }
+
+                    dechunker::Event::EndChunk => {
+                        assert!(
+                            buf.is_full(),
+                            "Got IHDR EndChunk, but buffer is not filled!"
+                        );
+                        let header = ImageHeader {
+                            width: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                            height: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+                            bit_depth: buf[8],
+                            colour_type: buf[9],
+                            compression_method: buf[10],
+                            filter_method: buf[11],
+                            interlace_method: buf[12],
+                        };
+                        Ok((None, Some(Event::ImageHeader(header))))
+                    }
+                    dechunker::Event::BeginChunk(_) => {
+                        panic!("Illegal BeginChunk inside of existing chunk")
+                    }
+                },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn decode_simple_ihdr() {
+            let mut d = StreamDecoder::new();
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 13,
+                    type_: *b"IHDR"
+                }))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::Data(&[
+                    0, 0, 0, 1, // width
+                    0, 0, 0, 2, // height
+                    3, 4, 5, 6, 7
+                ]))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::EndChunk).unwrap(),
+                (
+                    None,
+                    Some(Event::ImageHeader(ImageHeader {
+                        width: 1,
+                        height: 2,
+                        bit_depth: 3,
+                        colour_type: 4,
+                        compression_method: 5,
+                        filter_method: 6,
+                        interlace_method: 7,
+                    }))
+                )
+            );
+
+            // Hmmm, should we assert that? Which layer checks if we had IEND?
+            d.eof().unwrap();
+        }
+
+        #[test]
+        fn decode_partial_ihdr() {
+            let mut d = StreamDecoder::new();
+
+            assert_eq!(
+                d.update(dechunker::Event::BeginChunk(ChunkHeader {
+                    len: 13,
+                    type_: *b"IHDR"
+                }))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::Data(&[
+                    0, 0, 0, 1, // width
+                    0, 0, 0,
+                ]))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::Data(&[
+                    2, // height
+                    3, 4, 5, 6, 7
+                ]))
+                .unwrap(),
+                (None, None)
+            );
+
+            assert_eq!(
+                d.update(dechunker::Event::EndChunk).unwrap(),
+                (
+                    None,
+                    Some(Event::ImageHeader(ImageHeader {
+                        width: 1,
+                        height: 2,
+                        bit_depth: 3,
+                        colour_type: 4,
+                        compression_method: 5,
+                        filter_method: 6,
+                        interlace_method: 7,
+                    }))
+                )
+            );
+
+            // Hmmm, should we assert that? Which layer checks if we had IEND?
+            d.eof().unwrap();
         }
     }
 }
