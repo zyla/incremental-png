@@ -6,6 +6,9 @@ use heapless::Vec;
 pub enum Error {
     UnfinishedChunk,
     InvalidImageHeaderLength,
+    NoImageHeader,
+    InvalidDeflateStream,
+    ChecksumMismatch,
 }
 
 pub mod dechunker {
@@ -493,6 +496,154 @@ pub mod stream_decoder {
 
             // Hmmm, should we assert that? Which layer checks if we had IEND?
             d.eof().unwrap();
+        }
+    }
+}
+
+pub mod inflater {
+    use super::stream_decoder as sd;
+    use super::*;
+    use crate::stream_decoder::ImageHeader;
+    use miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER;
+    use miniz_oxide::inflate::core::inflate_flags::{
+        TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    };
+    use miniz_oxide::inflate::core::DecompressorOxide;
+
+    const MAX_WINDOW: usize = 32768;
+
+    pub struct Inflater {
+        decompressor: DecompressorOxide,
+        more_output: bool,
+        output_buf: [u8; MAX_WINDOW],
+        out_pos: usize,
+    }
+
+    #[derive(Eq, PartialEq, Debug)]
+    pub enum Event<'a> {
+        /// Passthrough ImageHeader
+        ImageHeader(ImageHeader),
+        ImageData(&'a [u8]),
+    }
+
+    impl Inflater {
+        pub fn new() -> Self {
+            Self {
+                decompressor: DecompressorOxide::new(),
+                more_output: false,
+                output_buf: [0; MAX_WINDOW],
+                out_pos: 0,
+            }
+        }
+        pub fn update<'this, 'a>(
+            &'this mut self,
+            input: sd::Event<'a>,
+        ) -> Result<(Option<sd::Event<'a>>, Option<Event<'this>>), Error> {
+            match input {
+                sd::Event::ImageHeader(header) => Ok((None, Some(Event::ImageHeader(header)))),
+                sd::Event::ImageData(input) => {
+                    let input = if self.more_output {
+                        self.more_output = false;
+                        &[]
+                    } else {
+                        input
+                    };
+                    let (status, bytes_read, bytes_written) =
+                        miniz_oxide::inflate::core::decompress(
+                            &mut self.decompressor,
+                            input,
+                            &mut self.output_buf,
+                            self.out_pos,
+                            TINFL_FLAG_PARSE_ZLIB_HEADER
+                                | TINFL_FLAG_HAS_MORE_INPUT
+                                | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+                        );
+                    match status {
+                        miniz_oxide::inflate::TINFLStatus::FailedCannotMakeProgress => {
+                            panic!("Shouldn't happen, we set TINFL_FLAG_HAS_MORE_INPUT")
+                        }
+
+                        miniz_oxide::inflate::TINFLStatus::BadParam => {
+                            panic!("Bad param to miniz_oxide")
+                        }
+                        miniz_oxide::inflate::TINFLStatus::Adler32Mismatch => {
+                            return Err(Error::ChecksumMismatch)
+                        }
+                        miniz_oxide::inflate::TINFLStatus::Failed => {
+                            return Err(Error::InvalidDeflateStream)
+                        }
+                        miniz_oxide::inflate::TINFLStatus::Done => {
+                            // TODO: should we somehow remember it, so that we don't cal decompress
+                            // anymore?
+                        }
+                        miniz_oxide::inflate::TINFLStatus::NeedsMoreInput => {}
+                        miniz_oxide::inflate::TINFLStatus::HasMoreOutput => {
+                            self.more_output = true;
+                        }
+                    }
+
+                    let old_pos = self.out_pos;
+                    self.out_pos = (self.out_pos + bytes_written) % self.output_buf.len();
+
+                    let leftover_input = if bytes_read < input.len() {
+                        Some(sd::Event::ImageData(&input[bytes_read..]))
+                    } else {
+                        None
+                    };
+
+                    Ok((
+                        leftover_input,
+                        Some(Event::ImageData(
+                            &self.output_buf[old_pos..old_pos + bytes_written],
+                        )),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::sd;
+        use super::*;
+        use crate::inflater::Inflater;
+
+        #[test]
+        fn decode_simple_compressed_stream() {
+            let mut d = Inflater::new();
+
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"hello", 5);
+
+            assert_eq!(
+                d.update(sd::Event::ImageData(&compressed)).unwrap(),
+                (None, Some(Event::ImageData(b"hello")))
+            );
+
+            // TODO: check if we are at the end?
+        }
+
+        #[test]
+        fn decode_inflated_output() {
+            let mut d = Inflater::new();
+
+            const N: usize = 65536;
+            let input = [b'A'; N];
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&input, 5);
+
+            let mut output = Vec::<u8, N>::new();
+
+            let mut event = Some(sd::Event::ImageData(&compressed));
+            while let Some(e) = event {
+                let (leftover, output_event) = d.update(e).unwrap();
+                match output_event {
+                    Some(Event::ImageData(data)) => output.extend_from_slice(data).unwrap(),
+                    None => {}
+                    _ => panic!("expected only ImageData output"),
+                }
+                event = leftover;
+            }
+
+            assert_eq!(&input, &output);
         }
     }
 }
