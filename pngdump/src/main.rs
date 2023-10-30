@@ -2,7 +2,9 @@ use std::io::Read;
 use std::{fs::File, path::PathBuf};
 
 use clap::Parser;
-use incremental_png::{dechunker::Dechunker, inflater::Inflater, stream_decoder::StreamDecoder};
+use incremental_png::{
+    dechunker::Dechunker, inflater::Inflater, stream_decoder as sd, stream_decoder::StreamDecoder,
+};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -14,6 +16,9 @@ struct Args {
 
     #[arg(long)]
     print_sizes: bool,
+
+    #[arg(long)]
+    print_window_size: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -35,6 +40,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut buf = vec![0u8; args.input_buffer_size];
+
+    if args.print_window_size {
+        print_window_size(file, &mut buf)?;
+        return Ok(());
+    }
+
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -66,5 +77,42 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn print_window_size(mut file: impl std::io::Read, buf: &mut [u8]) -> anyhow::Result<()> {
+    let mut dechunker = Dechunker::new();
+    let mut sd = StreamDecoder::new();
+
+    loop {
+        let n = file.read(buf)?;
+        if n == 0 {
+            break;
+        }
+        let mut input = &buf[..n];
+
+        while !input.is_empty() {
+            let (consumed, mut dc_event) = dechunker.update(&input).unwrap();
+
+            while let Some(e) = dc_event {
+                let (leftover, sd_event) = sd.update(e).unwrap();
+
+                if let Some(e) = sd_event {
+                    match e {
+                        sd::Event::ImageData(data) => {
+                            let size = 1 << ((data[0] as u32 >> 4) + 8);
+                            println!("{}", size);
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+
+                dc_event = leftover;
+            }
+
+            input = &input[consumed..];
+        }
+    }
     Ok(())
 }
