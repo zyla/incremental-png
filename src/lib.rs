@@ -734,9 +734,9 @@ pub mod inflater {
     use crate::stream_decoder::ImageHeader;
     use miniz_oxide::inflate::stream::InflateState;
 
-    pub struct Inflater<const BUFFER_SIZE: usize = 1024> {
+    pub struct Inflater<Buffer> {
         decompressor: InflateState,
-        output_buf: [u8; BUFFER_SIZE],
+        output_buf: Buffer,
     }
 
     #[derive(Eq, PartialEq, Debug)]
@@ -748,13 +748,23 @@ pub mod inflater {
         End,
     }
 
-    impl<const BUFFER_SIZE: usize> Inflater<BUFFER_SIZE> {
-        pub fn new() -> Self {
+    impl<Buffer> Inflater<Buffer> {
+        pub fn with_buffer(output_buf: Buffer) -> Self {
             Self {
                 decompressor: InflateState::new(miniz_oxide::DataFormat::Zlib),
-                output_buf: [0; BUFFER_SIZE],
+                output_buf,
             }
         }
+    }
+
+    impl<Buffer: Default> Inflater<Buffer> {
+        pub fn new() -> Self {
+            Self::with_buffer(Default::default())
+        }
+    }
+
+    impl<Buffer: AsMut<[u8]>> Inflater<Buffer> {
+
         pub fn update<'this, 'a>(
             &'this mut self,
             input: sd::Event<'a>,
@@ -765,7 +775,7 @@ pub mod inflater {
                     let result = miniz_oxide::inflate::stream::inflate(
                         &mut self.decompressor,
                         input,
-                        &mut self.output_buf,
+                        self.output_buf.as_mut(),
                         miniz_oxide::MZFlush::None,
                     );
 
@@ -786,7 +796,7 @@ pub mod inflater {
 
                     let leftover_input = if result.bytes_consumed < input.len() {
                         Some(sd::Event::ImageData(&input[result.bytes_consumed..]))
-                    } else if result.bytes_written == self.output_buf.len() {
+                    } else if result.bytes_written == self.output_buf.as_mut().len() {
                         // If we filled the output buffer, we might possibly need more calls
                         Some(sd::Event::ImageData(&[]))
                     } else {
@@ -795,7 +805,7 @@ pub mod inflater {
 
                     Ok((
                         leftover_input,
-                        Some(Event::ImageData(&self.output_buf[..result.bytes_written])),
+                        Some(Event::ImageData(&self.output_buf.as_mut()[..result.bytes_written])),
                     ))
                 }
                 sd::Event::End => Ok((None, Some(Event::End))),
@@ -811,7 +821,7 @@ pub mod inflater {
 
         #[test]
         fn decode_simple_compressed_stream() {
-            let mut d = Inflater::<1024>::new();
+            let mut d = Inflater::with_buffer([0u8; 1024]);
 
             let compressed = miniz_oxide::deflate::compress_to_vec_zlib(b"hello", 5);
 
@@ -827,7 +837,7 @@ pub mod inflater {
         fn decode_inflated_output() {
             const N: usize = 65536;
 
-            let mut d = Inflater::<1024>::new();
+            let mut d = Inflater::with_buffer([0u8; 1024]);
 
             let input = [b'A'; N];
             let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&input, 5);
