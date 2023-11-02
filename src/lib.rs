@@ -778,7 +778,12 @@ pub mod inflater {
                             }
                             miniz_oxide::MZError::Data => return Err(Error::InvalidDeflateStream),
                             miniz_oxide::MZError::Mem => panic!("shouldn't happen"),
-                            miniz_oxide::MZError::Buf => panic!("buffer error"),
+                            miniz_oxide::MZError::Buf => {
+                                if !input.is_empty() {
+                                    panic!("buffer error, input len={}", input.len())
+                                }
+                                // Otherwise okay, it just wants more input
+                            }
                             miniz_oxide::MZError::Version => panic!("shouldn't happen"),
                             miniz_oxide::MZError::Param => panic!("shouldn't happen"),
                         },
@@ -821,6 +826,34 @@ pub mod inflater {
             );
 
             // TODO: check if we are at the end?
+        }
+
+        #[test]
+        fn very_incremental() {
+            let mut d = Inflater::<1024>::new();
+
+            const INPUT: &[u8] = b"hello world";
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(INPUT, 5);
+
+            let mut output = Vec::<u8, { INPUT.len() }>::new();
+
+            let mut current_input = compressed.as_slice();
+            while !current_input.is_empty() {
+                let n = core::cmp::min(2, current_input.len());
+                let mut event = Some(sd::Event::ImageData(&current_input[..n]));
+                current_input = &current_input[n..];
+                while let Some(e) = event {
+                    let (leftover, output_event) = d.update(e).unwrap();
+                    match output_event {
+                        Some(Event::ImageData(data)) => output.extend_from_slice(data).unwrap(),
+                        None => {}
+                        _ => panic!("expected only ImageData output"),
+                    }
+                    event = leftover;
+                }
+            }
+
+            assert_eq!(&INPUT, &output);
         }
 
         #[test]
