@@ -11,6 +11,23 @@ pub enum Error {
     InvalidDeflateStream,
     ChecksumMismatch,
     InvalidEndChunkSize,
+    InvalidPaletteChunkSize,
+}
+
+pub struct Palette {
+    data: Vec<u8, { 256 * 3 }>,
+}
+
+impl Palette {
+    pub fn color_at(&self, index: u8) -> [u8; 3] {
+        if (index as usize + 1) * 3 > self.data.len() {
+            [0; 3]
+        } else {
+            self.data[index as usize * 3..(index as usize + 1) * 3]
+                .try_into()
+                .unwrap()
+        }
+    }
 }
 
 pub mod dechunker {
@@ -341,12 +358,14 @@ pub mod stream_decoder {
 
     pub struct StreamDecoder {
         state: State,
+        palette: Palette,
     }
 
     #[derive(Clone, PartialEq, Eq, Debug)]
     enum State {
         BeforeChunk,
         IHDR(Vec<u8, { ImageHeader::SIZE }>),
+        PLTE,
         IDAT,
         IgnoredChunk,
         IEND,
@@ -375,6 +394,7 @@ pub mod stream_decoder {
     }
 
     const IHDR: ChunkType = *b"IHDR";
+    const PLTE: ChunkType = *b"PLTE";
     const IDAT: ChunkType = *b"IDAT";
     const IEND: ChunkType = *b"IEND";
 
@@ -389,7 +409,14 @@ pub mod stream_decoder {
         pub fn new() -> Self {
             Self {
                 state: State::initial(),
+                palette: Palette {
+                    data: Default::default(),
+                },
             }
+        }
+
+        pub fn palette(&self) -> &Palette {
+            &self.palette
         }
 
         pub fn eof(&self) -> Result<(), Error> {
@@ -420,6 +447,13 @@ pub mod stream_decoder {
                             return Err(Error::InvalidEndChunkSize);
                         }
                         self.state = State::IEND;
+                        Ok((None, None))
+                    }
+                    dechunker::Event::BeginChunk(ChunkHeader { type_: PLTE, len }) => {
+                        if len % 3 != 0 || len > 256 * 3 {
+                            return Err(Error::InvalidPaletteChunkSize);
+                        }
+                        self.state = State::PLTE;
                         Ok((None, None))
                     }
                     dechunker::Event::BeginChunk(ChunkHeader { .. }) => {
@@ -457,6 +491,20 @@ pub mod stream_decoder {
                     dechunker::Event::BeginChunk(_) => {
                         panic!("Illegal BeginChunk inside of existing chunk")
                     }
+                },
+
+                State::PLTE => match input {
+                    dechunker::Event::Data(input) => {
+                        if self.palette.data.extend_from_slice(input).is_err() {
+                            panic!("Too much data in PLTE chunk");
+                        }
+                        Ok((None, None))
+                    }
+                    dechunker::Event::EndChunk => {
+                        self.state = State::initial();
+                        Ok((None, None))
+                    }
+                    _ => panic!("Illegal event inside PLTE chunk"),
                 },
 
                 State::IDAT => match input {
